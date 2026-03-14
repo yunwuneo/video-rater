@@ -53,6 +53,13 @@ LLM_API_KEY = os.environ.get("LLM_API_KEY", "").strip() or None
 LLM_MODEL_NAME = os.environ.get("LLM_MODEL_NAME", "").strip() or "gpt-4o-mini"
 
 # -----------------------------------------------------------------------------
+# 身份认证（公网部署时启用）
+# -----------------------------------------------------------------------------
+AUTH_ENABLED = os.environ.get("VIDEO_RATER_AUTH_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+AUTH_ADMIN_USER = (os.environ.get("VIDEO_RATER_ADMIN_USER", "").strip() or "admin")
+AUTH_ADMIN_PASSWORD = os.environ.get("VIDEO_RATER_ADMIN_PASSWORD", "").strip()
+
+# -----------------------------------------------------------------------------
 # Logging
 # -----------------------------------------------------------------------------
 logging.basicConfig(
@@ -87,6 +94,109 @@ def ensure_table(conn):
             );
         """)
         conn.commit()
+
+
+# -----------------------------------------------------------------------------
+# 身份认证：用户表与密码校验（直接使用 bcrypt，避免 passlib 与新版 bcrypt 不兼容）
+# -----------------------------------------------------------------------------
+def _bcrypt_secret(password: str) -> bytes:
+    """Encode password for bcrypt; bcrypt 仅支持最多 72 字节，超出部分截断。"""
+    raw = password.encode("utf-8")
+    return raw[:72] if len(raw) > 72 else raw
+
+
+def _hash_password(password: str) -> str:
+    import bcrypt
+    return bcrypt.hashpw(_bcrypt_secret(password), bcrypt.gensalt()).decode("ascii")
+
+
+def _verify_password(password: str, password_hash: str) -> bool:
+    import bcrypt
+    try:
+        return bcrypt.checkpw(_bcrypt_secret(password), password_hash.encode("ascii"))
+    except Exception:
+        return False
+
+
+def ensure_users_table(conn):
+    """Create users table for auth if it does not exist."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS video_rater_users (
+                id SERIAL PRIMARY KEY,
+                username VARCHAR(128) UNIQUE NOT NULL,
+                password_hash VARCHAR(256) NOT NULL,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            );
+        """)
+        conn.commit()
+
+
+def ensure_auth_admin(conn):
+    """If no users exist and admin password is set in env, create initial admin user."""
+    if not AUTH_ADMIN_PASSWORD:
+        return
+    with conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) AS n FROM video_rater_users")
+        if cur.fetchone()["n"] > 0:
+            return
+        cur.execute(
+            "INSERT INTO video_rater_users (username, password_hash) VALUES (%s, %s) ON CONFLICT (username) DO NOTHING",
+            (AUTH_ADMIN_USER, _hash_password(AUTH_ADMIN_PASSWORD)),
+        )
+        conn.commit()
+    logger.info("Created initial admin user: %s", AUTH_ADMIN_USER)
+
+
+def get_user_by_username(conn, username: str) -> Optional[dict]:
+    """Return user row (with password_hash) or None."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, username, password_hash FROM video_rater_users WHERE username = %s",
+            (username.strip(),),
+        )
+        return cur.fetchone()
+
+
+def verify_login(conn, username: str, password: str) -> bool:
+    """Verify credentials; return True if valid."""
+    user = get_user_by_username(conn, username)
+    if not user or not password:
+        return False
+    return _verify_password(password, user["password_hash"])
+
+
+def render_login_page(conn):
+    """Show login form; on success set session and rerun. Caller should return after this."""
+    st.set_page_config(page_title="登录 — Video Rater", layout="centered")
+    st.title("Video Rater — 登录")
+    st.caption("请使用账号密码登录后使用标注功能。")
+    with st.form("login_form"):
+        username = st.text_input("用户名", key="login_username", autocomplete="username")
+        password = st.text_input("密码", type="password", key="login_password", autocomplete="current-password")
+        submitted = st.form_submit_button("登录")
+    if submitted:
+        if not username or not password:
+            st.error("请输入用户名和密码。")
+            return
+        if verify_login(conn, username, password):
+            st.session_state["authenticated"] = True
+            st.session_state["username"] = username.strip()
+            st.rerun()
+        else:
+            st.error("用户名或密码错误。")
+
+
+def render_logout_sidebar():
+    """Show current user and logout in sidebar."""
+    if not st.session_state.get("authenticated"):
+        return
+    with st.sidebar:
+        st.caption(f"已登录: **{st.session_state.get('username', '')}**")
+        if st.button("退出登录", key="logout_btn"):
+            st.session_state["authenticated"] = False
+            st.session_state.pop("username", None)
+            st.rerun()
 
 
 def get_rated_video_paths(conn):
@@ -426,7 +536,18 @@ def _load_features_background(video_path_str: str, json_path: Path) -> None:
 # Streamlit UI
 # -----------------------------------------------------------------------------
 def main():
+    # 身份认证：公网部署时在入口处校验
+    if AUTH_ENABLED:
+        conn_auth = get_db_connection()
+        ensure_users_table(conn_auth)
+        ensure_auth_admin(conn_auth)
+        if not st.session_state.get("authenticated"):
+            render_login_page(conn_auth)
+            return
+
     st.set_page_config(page_title="Video Rater — Taste DB", layout="wide")
+    if AUTH_ENABLED:
+        render_logout_sidebar()
     # 视频播放器适配视口：PC/手机均无需上下滚动即可看到完整内容
     st.markdown(
         """

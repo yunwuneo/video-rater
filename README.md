@@ -75,11 +75,24 @@ VIDEO_RATER_STREAMLIT=1 streamlit run app.py
 | `PGUSER` | `postgres` | 数据库用户 |
 | `PGPASSWORD` | _(空)_ | 数据库密码 |
 | `VIDEO_RATER_BASE` | `.`（当前目录）| 视频与分析文件的父目录路径 |
+| `VIDEO_RATER_AUTH_ENABLED` | `false` | 设为 `true`/`1`/`yes` 启用登录认证（公网部署建议开启） |
+| `VIDEO_RATER_ADMIN_USER` | `admin` | 首次创建的管理员用户名（仅当数据库尚无用户时生效） |
+| `VIDEO_RATER_ADMIN_PASSWORD` | _(空)_ | 管理员初始密码；启用认证且数据库无用户时自动创建该账号 |
 | `LLM_APP_URL` | _(未设置)_ | LLM API base URL，如 `https://api.openai.com/v1` |
 | `LLM_API_KEY` | _(未设置)_ | LLM API 密钥 |
 | `LLM_MODEL_NAME` | `gpt-4o-mini` | 使用的模型名称 |
 
 > **注意**：修改 `.env` 后需重启应用才能生效。
+
+### 身份认证（公网部署）
+
+部署到公网时建议开启认证，避免未授权访问：
+
+1. 在 `.env` 中设置 `VIDEO_RATER_AUTH_ENABLED=true`，并设置 `VIDEO_RATER_ADMIN_USER` 与 `VIDEO_RATER_ADMIN_PASSWORD`。
+2. 首次启动时，若数据库中没有用户，会自动创建该管理员账号。
+3. 用户表 `video_rater_users` 与 `video_preferences` 一样由应用自动创建；后续如需新增用户，需在数据库中手动插入（密码需用 bcrypt 哈希）。
+
+登录后可在侧边栏看到当前用户名并点击「退出登录」。
 
 ## LLM 配置示例
 
@@ -103,7 +116,9 @@ LLM_MODEL_NAME=openai/gpt-4o-mini
 
 ## 数据库表结构
 
-应用启动时自动创建 `video_preferences` 表：
+应用启动时自动创建以下表。
+
+**video_preferences**（标注数据）：
 
 ```sql
 CREATE TABLE video_preferences (
@@ -117,6 +132,17 @@ CREATE TABLE video_preferences (
 );
 ```
 
+**video_rater_users**（启用认证时创建，用于登录）：
+
+```sql
+CREATE TABLE video_rater_users (
+    id            SERIAL PRIMARY KEY,
+    username      VARCHAR(128) UNIQUE NOT NULL,
+    password_hash VARCHAR(256) NOT NULL,
+    created_at    TIMESTAMPTZ DEFAULT NOW()
+);
+```
+
 ## 依赖
 
 | 包 | 最低版本 | 说明 |
@@ -125,3 +151,4 @@ CREATE TABLE video_preferences (
 | `psycopg2-binary` | 2.9.9 | PostgreSQL 驱动 |
 | `python-dotenv` | 1.0.0 | 读取 `.env` 配置文件 |
 | `openai` | 1.0.0 | LLM 特征提取（可选） |
+| `bcrypt` | 4.0.0 | 密码哈希（启用认证时使用） |
