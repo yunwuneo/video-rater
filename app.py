@@ -8,7 +8,9 @@ import json
 import logging
 import os
 import re
+import threading
 import urllib.request
+from datetime import timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -401,11 +403,52 @@ def extract_feature_options(analysis: dict, debug_out: dict | None = None) -> li
     return options
 
 
+# 模块级缓存，供后台线程写入，避免在非主线程访问 session_state
+_feature_cache: dict[str, list[str]] = {}
+_feature_loading: set[str] = set()
+_feature_cache_lock = threading.Lock()
+
+
+def _load_features_background(video_path_str: str, json_path: Path) -> None:
+    """在后台线程中加载特征并写入模块级缓存（session_state 由 fragment 同步）"""
+    try:
+        analysis = load_analysis(json_path)
+        if analysis:
+            options = extract_feature_options(analysis, debug_out=None)
+            with _feature_cache_lock:
+                _feature_cache[video_path_str] = options
+    finally:
+        with _feature_cache_lock:
+            _feature_loading.discard(video_path_str)
+
+
 # -----------------------------------------------------------------------------
 # Streamlit UI
 # -----------------------------------------------------------------------------
 def main():
     st.set_page_config(page_title="Video Rater — Taste DB", layout="wide")
+    # 视频播放器适配视口：PC/手机均无需上下滚动即可看到完整内容
+    st.markdown(
+        """
+        <style>
+        /* 视频播放器适配视口：PC/手机均无需上下滚动即可看到完整内容 */
+        [data-testid="stVideo"],
+        [data-testid="stVideo"] video,
+        .stVideo,
+        .stVideo video {
+            max-height: calc(100vh - 180px) !important;
+            width: 100% !important;
+            object-fit: contain !important;
+        }
+        /* 确保视频元素正确缩放 */
+        [data-testid="stVideo"] video,
+        .stVideo video {
+            display: block !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
     st.title("Video Annotation — Taste Prediction Database")
 
     conn = get_db_connection()
@@ -449,23 +492,23 @@ def main():
     with left:
         st.subheader("Video")
         if Path(video_full_path).is_file():
-            st.video(video_full_path)
+            st.video(video_full_path, autoplay=True, loop=True, muted=True)
         else:
             st.warning("Video file not found.")
 
+        # 切换视频按钮：在 LLM 加载标签期间也可快速切换
+        col_prev, _, col_next = st.columns([1, 2, 1])
+        with col_prev:
+            if st.button("← 上一视频", key="btn_prev_video", disabled=(idx <= 0)):
+                st.session_state.current_index = max(0, idx - 1)
+                st.rerun()
+        with col_next:
+            if st.button("下一视频 →", key="btn_next_video", disabled=(idx >= len(unrated) - 1)):
+                st.session_state.current_index = min(len(unrated) - 1, idx + 1)
+                st.rerun()
+
     with right:
         st.subheader("Metadata & Annotation")
-
-        # Metadata from JSON (safe .get); summary may be in video_description.response
-        st.markdown("**Summary**")
-        vd = analysis.get("video_description")
-        summary = (
-            analysis.get("summary")
-            or analysis.get("description")
-            or (vd.get("response") if isinstance(vd, dict) else None)
-            or "—"
-        )
-        st.text(summary[:500] + ("…" if len(str(summary)) > 500 else ""))
 
         tags = analysis.get("tags") or []
         if tags:
@@ -496,40 +539,90 @@ def main():
             key="overall_score",
         )
 
-        llm_debug = {}
-        feature_options = extract_feature_options(analysis, debug_out=llm_debug)
         session_key = f"liked_features_{video_path_str}"
         if session_key not in st.session_state:
             st.session_state[session_key] = []
+
+        @st.fragment(run_every=timedelta(seconds=2))
+        def feature_section():
+            """标签区域：优先从 session_state/缓存读取，未命中时后台加载，加载期间可切换视频"""
+            # 优先用 session_state，避免 fragment-only rerun 时闭包/模块缓存不同步
+            if "feature_options_cache" not in st.session_state:
+                st.session_state.feature_options_cache = {}
+            feature_options = st.session_state.feature_options_cache.get(video_path_str)
+            is_loading = False
+
+            if not feature_options:
+                with _feature_cache_lock:
+                    feature_options = _feature_cache.get(video_path_str)
+                    is_loading = video_path_str in _feature_loading
+                if feature_options:
+                    st.session_state.feature_options_cache[video_path_str] = feature_options
+
+            if not feature_options and not is_loading:
+                with _feature_cache_lock:
+                    _feature_loading.add(video_path_str)
+                t = threading.Thread(
+                    target=_load_features_background,
+                    args=(video_path_str, json_path),
+                    daemon=True,
+                )
+                t.start()
+                is_loading = True
+
+            if is_loading and not feature_options:
+                st.info("标签加载中… 可先使用左侧按钮切换视频。")
+                return
+
+            if feature_options:
+                llm_debug = {}
+                extract_feature_options(analysis, debug_out=llm_debug)
+                if "llm_debug" not in st.session_state:
+                    st.session_state.llm_debug = {}
+                st.session_state.llm_debug[video_path_str] = llm_debug
+
+                liked_features = st.session_state[session_key]
+                st.markdown("**Which specific features did you particularly like?**")
+                cols_per_row = 6
+                for i in range(0, len(feature_options), cols_per_row):
+                    cols = st.columns(cols_per_row)
+                    for j, col in enumerate(cols):
+                        if i + j < len(feature_options):
+                            feat = feature_options[i + j]
+                            with col:
+                                is_selected = feat in liked_features
+                                if st.button(
+                                    feat,
+                                    type="primary" if is_selected else "secondary",
+                                    key=f"feat_{idx}_{i}_{j}",
+                                ):
+                                    if feat in liked_features:
+                                        liked_features.remove(feat)
+                                    else:
+                                        liked_features.append(feat)
+                                    st.rerun()
+                st.caption(
+                    "选项由帧描述、总结文本中提取的特征短语组成。点击按钮可多选。"
+                    + (" 已启用云端 LLM 提取。" if (LLM_APP_URL and LLM_API_KEY) else " 使用本地规则提取。配置 LLM_APP_URL、LLM_API_KEY 可启用云端提取。")
+                )
+            else:
+                st.session_state[session_key] = []
+                st.caption("未能从帧描述和总结文本中提取到特征短语。可配置 LLM_APP_URL、LLM_API_KEY 使用云端模型提取。")
+
+        llm_debug = st.session_state.get("llm_debug", {}).get(video_path_str, {})
+        feature_section()
         liked_features = st.session_state[session_key]
 
-        if feature_options:
-            st.markdown("**Which specific features did you particularly like?**")
-            cols_per_row = 6
-            for i in range(0, len(feature_options), cols_per_row):
-                cols = st.columns(cols_per_row)
-                for j, col in enumerate(cols):
-                    if i + j < len(feature_options):
-                        feat = feature_options[i + j]
-                        with col:
-                            is_selected = feat in liked_features
-                            if st.button(
-                                feat,
-                                type="primary" if is_selected else "secondary",
-                                key=f"feat_{idx}_{i}_{j}",
-                            ):
-                                if feat in liked_features:
-                                    liked_features.remove(feat)
-                                else:
-                                    liked_features.append(feat)
-                                st.rerun()
-            st.caption(
-                "选项由帧描述、总结文本中提取的特征短语组成。点击按钮可多选。"
-                + (" 已启用云端 LLM 提取。" if (LLM_APP_URL and LLM_API_KEY) else " 使用本地规则提取。配置 LLM_APP_URL、LLM_API_KEY 可启用云端提取。")
-            )
-        else:
-            liked_features = []
-            st.caption("未能从帧描述和总结文本中提取到特征短语。可配置 LLM_APP_URL、LLM_API_KEY 使用云端模型提取。")
+        # Summary 置于标签区域下方，默认折叠
+        vd = analysis.get("video_description")
+        summary = (
+            analysis.get("summary")
+            or analysis.get("description")
+            or (vd.get("response") if isinstance(vd, dict) else None)
+            or "—"
+        )
+        with st.expander("📄 Summary", expanded=False):
+            st.text(summary[:500] + ("…" if len(str(summary)) > 500 else ""))
 
         with st.expander("🔧 LLM Debug", expanded=False):
             st.write("**配置**")
