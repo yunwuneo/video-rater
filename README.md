@@ -78,6 +78,11 @@ VIDEO_RATER_STREAMLIT=1 streamlit run app.py
 | `VIDEO_RATER_AUTH_ENABLED` | `false` | 设为 `true`/`1`/`yes` 启用登录认证（公网部署建议开启） |
 | `VIDEO_RATER_ADMIN_USER` | `admin` | 首次创建的管理员用户名（仅当数据库尚无用户时生效） |
 | `VIDEO_RATER_ADMIN_PASSWORD` | _(空)_ | 管理员初始密码；启用认证且数据库无用户时自动创建该账号 |
+| `VIDEO_RATER_OIDC_ISSUER` | _(未设置)_ | OIDC Issuer（如 Casdoor 地址），如 `https://door.casdoor.com` |
+| `VIDEO_RATER_OIDC_CLIENT_ID` | _(未设置)_ | OIDC 应用 Client ID |
+| `VIDEO_RATER_OIDC_CLIENT_SECRET` | _(未设置)_ | OIDC 应用 Client Secret（可选，视 IdP 要求） |
+| `VIDEO_RATER_OIDC_REDIRECT_URI` | _(未设置)_ | 回调地址，须与 Casdoor 应用内 Redirect URLs 一致 |
+| `VIDEO_RATER_OIDC_SCOPE` | `openid profile email` | OIDC scope |
 | `LLM_APP_URL` | _(未设置)_ | LLM API base URL，如 `https://api.openai.com/v1` |
 | `LLM_API_KEY` | _(未设置)_ | LLM API 密钥 |
 | `LLM_MODEL_NAME` | `gpt-4o-mini` | 使用的模型名称 |
@@ -93,6 +98,19 @@ VIDEO_RATER_STREAMLIT=1 streamlit run app.py
 3. 用户表 `video_rater_users` 与 `video_preferences` 一样由应用自动创建；后续如需新增用户，需在数据库中手动插入（密码需用 bcrypt 哈希）。
 
 登录后可在侧边栏看到当前用户名并点击「退出登录」。
+
+### OIDC / Casdoor 登录
+
+在启用认证的前提下，配置 OIDC 后登录页会显示「使用 Casdoor 登录」：
+
+1. 在 Casdoor 控制台创建应用，记下 **Client ID**、**Client Secret**；在应用的 **Redirect URLs** 中加入本应用的回调地址（例如 `https://你的域名/` 或 `http://localhost:8501/`）。
+2. 在 `.env` 中设置：
+   - `VIDEO_RATER_OIDC_ISSUER`：Casdoor 地址（如 `https://door.casdoor.com`，不要末尾斜杠）
+   - `VIDEO_RATER_OIDC_CLIENT_ID`、`VIDEO_RATER_OIDC_CLIENT_SECRET`
+   - `VIDEO_RATER_OIDC_REDIRECT_URI`：与 Casdoor 中填写的回调地址完全一致
+3. 重启应用，在登录页点击「使用 Casdoor 登录」完成 OIDC 流程。登录成功后用户名来自 IdP 的 `preferred_username`、`sub` 或 `name`。
+
+本地账号密码登录与 OIDC 可同时使用。
 
 ## LLM 配置示例
 
@@ -152,3 +170,4 @@ CREATE TABLE video_rater_users (
 | `python-dotenv` | 1.0.0 | 读取 `.env` 配置文件 |
 | `openai` | 1.0.0 | LLM 特征提取（可选） |
 | `bcrypt` | 4.0.0 | 密码哈希（启用认证时使用） |
+| `httpx` | 0.27.x | OIDC 发现、token 与 userinfo 请求 |

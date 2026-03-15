@@ -9,11 +9,13 @@ import logging
 import os
 import re
 import threading
+import time
 import urllib.request
 from datetime import timedelta
 from pathlib import Path
 from typing import Optional
 
+import httpx
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import streamlit as st
@@ -58,6 +60,19 @@ LLM_MODEL_NAME = os.environ.get("LLM_MODEL_NAME", "").strip() or "gpt-4o-mini"
 AUTH_ENABLED = os.environ.get("VIDEO_RATER_AUTH_ENABLED", "false").strip().lower() in ("1", "true", "yes")
 AUTH_ADMIN_USER = (os.environ.get("VIDEO_RATER_ADMIN_USER", "").strip() or "admin")
 AUTH_ADMIN_PASSWORD = os.environ.get("VIDEO_RATER_ADMIN_PASSWORD", "").strip()
+
+# OIDC（用于对接 Casdoor 等）
+OIDC_ISSUER = (os.environ.get("VIDEO_RATER_OIDC_ISSUER", "").strip() or "").rstrip("/") or None
+OIDC_CLIENT_ID = (os.environ.get("VIDEO_RATER_OIDC_CLIENT_ID", "").strip() or None)
+OIDC_CLIENT_SECRET = (os.environ.get("VIDEO_RATER_OIDC_CLIENT_SECRET", "").strip() or None)
+OIDC_REDIRECT_URI = (os.environ.get("VIDEO_RATER_OIDC_REDIRECT_URI", "").strip() or None)
+OIDC_SCOPE = (os.environ.get("VIDEO_RATER_OIDC_SCOPE", "").strip() or "openid profile email")
+OIDC_ENABLED = bool(
+    AUTH_ENABLED
+    and OIDC_ISSUER
+    and OIDC_CLIENT_ID
+    and OIDC_REDIRECT_URI
+)
 
 # -----------------------------------------------------------------------------
 # Logging
@@ -201,11 +216,167 @@ def update_password(conn, username: str, current_password: str, new_password: st
     return True, ""
 
 
+# -----------------------------------------------------------------------------
+# OIDC（Casdoor 等）发现、授权 URL、code 交换与 userinfo
+# state 存服务端，避免从 IdP 跳回时 session 丢失导致校验失败
+# -----------------------------------------------------------------------------
+_OIDC_STATE_TTL_SEC = 600  # 10 分钟
+
+
+@st.cache_resource
+def _oidc_state_store() -> tuple[dict[str, float], threading.Lock]:
+    """
+    跨会话共享的 OIDC state 存储。
+    使用 cache_resource 避免新会话回调时拿不到此前登记的 state。
+    """
+    return {}, threading.Lock()
+
+
+def _oidc_register_state(state: str) -> None:
+    """生成授权 URL 前将 state 登记到服务端存储。"""
+    pending, lock = _oidc_state_store()
+    now = time.time()
+    with lock:
+        # 顺带清理过期 state，避免常驻进程内存累积
+        expired = [k for k, ts in pending.items() if now - ts > _OIDC_STATE_TTL_SEC]
+        for k in expired:
+            pending.pop(k, None)
+        pending[state] = now
+
+
+def _oidc_consume_state(state: str) -> bool:
+    """回调时校验并消费 state：存在且未过期返回 True 并删除，否则返回 False。"""
+    pending, lock = _oidc_state_store()
+    with lock:
+        created = pending.pop(state, None)
+    if created is None:
+        return False
+    if time.time() - created > _OIDC_STATE_TTL_SEC:
+        return False
+    return True
+
+
+@st.cache_data(ttl=3600)
+def _oidc_discovery(issuer: str) -> Optional[dict]:
+    """获取 OIDC 发现文档；失败返回 None。"""
+    url = f"{issuer.rstrip('/')}/.well-known/openid-configuration"
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            r = client.get(url)
+            r.raise_for_status()
+            return r.json()
+    except Exception as e:
+        logger.warning("OIDC discovery failed for %s: %s", url, e)
+        return None
+
+
+def _oidc_auth_url(state: str) -> Optional[str]:
+    """构造 OIDC 授权 URL；若 discovery 失败返回 None。"""
+    if not OIDC_ISSUER or not OIDC_CLIENT_ID or not OIDC_REDIRECT_URI:
+        return None
+    doc = _oidc_discovery(OIDC_ISSUER)
+    if not doc:
+        return None
+    auth_endpoint = doc.get("authorization_endpoint")
+    if not auth_endpoint:
+        return None
+    from urllib.parse import urlencode
+    params = {
+        "response_type": "code",
+        "client_id": OIDC_CLIENT_ID,
+        "redirect_uri": OIDC_REDIRECT_URI,
+        "scope": OIDC_SCOPE,
+        "state": state,
+    }
+    return f"{auth_endpoint}?{urlencode(params)}"
+
+
+def _oidc_exchange_and_userinfo(code: str) -> tuple[Optional[str], Optional[str]]:
+    """
+    用 code 换取 token，再拉取 userinfo，返回 (username, error_message)。
+    成功时 error_message 为 None；失败时 username 为 None。
+    """
+    if not OIDC_ISSUER or not OIDC_CLIENT_ID or not OIDC_REDIRECT_URI:
+        return None, "OIDC 未配置完整"
+    doc = _oidc_discovery(OIDC_ISSUER)
+    if not doc:
+        return None, "无法获取 OIDC 发现文档"
+    token_endpoint = doc.get("token_endpoint")
+    userinfo_endpoint = doc.get("userinfo_endpoint")
+    if not token_endpoint or not userinfo_endpoint:
+        return None, "发现文档缺少 token_endpoint 或 userinfo_endpoint"
+    try:
+        with httpx.Client(timeout=15.0) as client:
+            # 使用 application/x-www-form-urlencoded 交换 code
+            token_data = {
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": OIDC_REDIRECT_URI,
+                "client_id": OIDC_CLIENT_ID,
+            }
+            if OIDC_CLIENT_SECRET:
+                token_data["client_secret"] = OIDC_CLIENT_SECRET
+            r = client.post(
+                token_endpoint,
+                data=token_data,
+                headers={"Accept": "application/json"},
+            )
+            r.raise_for_status()
+            token_json = r.json()
+            access_token = token_json.get("access_token")
+            if not access_token:
+                return None, "未返回 access_token"
+            # 拉取 userinfo
+            u = client.get(
+                userinfo_endpoint,
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+            u.raise_for_status()
+            userinfo = u.json()
+            # 优先 preferred_username，其次 sub、name
+            username = (
+                userinfo.get("preferred_username")
+                or userinfo.get("sub")
+                or userinfo.get("name")
+                or userinfo.get("email")
+            )
+            if not username:
+                username = str(userinfo.get("sub", "oidc_user"))
+            return str(username).strip(), None
+    except httpx.HTTPStatusError as e:
+        return None, f"OIDC 请求失败: {e.response.status_code}"
+    except Exception as e:
+        logger.warning("OIDC exchange/userinfo failed: %s", e)
+        return None, str(e)
+
+
 def render_login_page(conn):
     """Show login form; on success set session and rerun. Caller should return after this."""
     st.set_page_config(page_title="登录 — Video Rater", layout="centered")
     st.title("Video Rater — 登录")
     st.caption("请使用账号密码登录后使用标注功能。")
+
+    # OIDC 回调：URL 带 code 和 state 时，用服务端存储校验 state（不依赖 session）
+    q = st.query_params
+    if OIDC_ENABLED and q.get("code") and q.get("state"):
+        incoming_state = q.get("state", "")
+        if _oidc_consume_state(incoming_state):
+            code = q.get("code", "")
+            username, err = _oidc_exchange_and_userinfo(code)
+            if username and not err:
+                st.session_state["authenticated"] = True
+                st.session_state["username"] = username
+                st.session_state["auth_provider"] = "oidc"
+                # 清除 URL 中的 code/state，避免刷新时重复使用
+                for k in ("code", "state"):
+                    if k in st.query_params:
+                        del st.query_params[k]
+                st.rerun()
+            else:
+                st.error(f"OIDC 登录失败: {err or '未知错误'}")
+        else:
+            st.error("OIDC state 不匹配或已过期，请重新点击「使用 Casdoor 登录」。")
+
     with st.form("login_form"):
         username = st.text_input("用户名", key="login_username", autocomplete="username")
         password = st.text_input("密码", type="password", key="login_password", autocomplete="current-password")
@@ -220,6 +391,22 @@ def render_login_page(conn):
             st.rerun()
         else:
             st.error("用户名或密码错误。")
+
+    if OIDC_ENABLED:
+        import secrets
+        state = secrets.token_urlsafe(32)
+        _oidc_register_state(state)
+        auth_url = _oidc_auth_url(state)
+        if auth_url:
+            from urllib.parse import urlparse
+            redirect_path = (urlparse(OIDC_REDIRECT_URI).path or "/").rstrip("/") or "/"
+            st.divider()
+            st.caption("或使用 Casdoor (OIDC) 登录")
+            if redirect_path != "/":
+                st.warning("当前 OIDC 回调地址不是根路径 `/`，如出现回调异常请改为应用首页地址（例如 http://localhost:8501/）。")
+            st.link_button("使用 Casdoor 登录", url=auth_url, type="secondary")
+        else:
+            st.caption("OIDC 未就绪（请检查 VIDEO_RATER_OIDC_ISSUER 与发现文档）。")
 
 
 def render_account_sidebar(conn):
