@@ -166,6 +166,41 @@ def verify_login(conn, username: str, password: str) -> bool:
     return _verify_password(password, user["password_hash"])
 
 
+def update_username(conn, current_username: str, new_username: str, current_password: str) -> tuple[bool, str]:
+    """Update username; verify current password first. Returns (success, error_message)."""
+    user = get_user_by_username(conn, current_username)
+    if not user or not _verify_password(current_password, user["password_hash"]):
+        return False, "当前密码错误。"
+    new_username = new_username.strip()
+    if not new_username:
+        return False, "新用户名不能为空。"
+    if new_username == current_username:
+        return False, "新用户名与当前相同。"
+    existing = get_user_by_username(conn, new_username)
+    if existing is not None:
+        return False, "该用户名已被使用。"
+    with conn.cursor() as cur:
+        cur.execute("UPDATE video_rater_users SET username = %s WHERE id = %s", (new_username, user["id"]))
+        conn.commit()
+    return True, ""
+
+
+def update_password(conn, username: str, current_password: str, new_password: str) -> tuple[bool, str]:
+    """Update password; verify current password first. Returns (success, error_message)."""
+    user = get_user_by_username(conn, username)
+    if not user or not _verify_password(current_password, user["password_hash"]):
+        return False, "当前密码错误。"
+    if not new_password or len(new_password) < 6:
+        return False, "新密码至少 6 位。"
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE video_rater_users SET password_hash = %s WHERE id = %s",
+            (_hash_password(new_password), user["id"]),
+        )
+        conn.commit()
+    return True, ""
+
+
 def render_login_page(conn):
     """Show login form; on success set session and rerun. Caller should return after this."""
     st.set_page_config(page_title="登录 — Video Rater", layout="centered")
@@ -187,12 +222,49 @@ def render_login_page(conn):
             st.error("用户名或密码错误。")
 
 
-def render_logout_sidebar():
-    """Show current user and logout in sidebar."""
+def render_account_sidebar(conn):
+    """Show current user, change username/password, and logout in sidebar."""
     if not st.session_state.get("authenticated"):
         return
+    username = st.session_state.get("username", "")
     with st.sidebar:
-        st.caption(f"已登录: **{st.session_state.get('username', '')}**")
+        st.caption(f"已登录: **{username}**")
+        with st.expander("修改账号 / 密码"):
+            # 修改用户名
+            st.caption("修改用户名")
+            with st.form("change_username_form", clear_on_submit=True):
+                new_username = st.text_input("新用户名", key="acct_new_username", autocomplete="username")
+                current_pw_for_name = st.text_input("当前密码（验证身份）", type="password", key="acct_pw_for_name")
+                if st.form_submit_button("保存用户名"):
+                    if new_username and current_pw_for_name:
+                        ok, err = update_username(conn, username, new_username, current_pw_for_name)
+                        if ok:
+                            st.session_state["username"] = new_username.strip()
+                            st.success("用户名已更新。")
+                            st.rerun()
+                        else:
+                            st.error(err)
+                    else:
+                        st.warning("请填写新用户名和当前密码。")
+            st.divider()
+            # 修改密码
+            st.caption("修改密码")
+            with st.form("change_password_form", clear_on_submit=True):
+                current_pw = st.text_input("当前密码", type="password", key="acct_current_pw")
+                new_pw = st.text_input("新密码（至少 6 位）", type="password", key="acct_new_pw")
+                new_pw_confirm = st.text_input("确认新密码", type="password", key="acct_new_pw_confirm")
+                if st.form_submit_button("保存密码"):
+                    if current_pw and new_pw and new_pw_confirm:
+                        if new_pw != new_pw_confirm:
+                            st.error("两次输入的新密码不一致。")
+                        else:
+                            ok, err = update_password(conn, username, current_pw, new_pw)
+                            if ok:
+                                st.success("密码已更新。")
+                            else:
+                                st.error(err)
+                    else:
+                        st.warning("请填写当前密码、新密码并确认。")
         if st.button("退出登录", key="logout_btn"):
             st.session_state["authenticated"] = False
             st.session_state.pop("username", None)
@@ -546,8 +618,9 @@ def main():
             return
 
     st.set_page_config(page_title="Video Rater — Taste DB", layout="wide")
+    conn = get_db_connection()
     if AUTH_ENABLED:
-        render_logout_sidebar()
+        render_account_sidebar(conn)
     # 视频播放器适配视口：PC/手机均无需上下滚动即可看到完整内容
     st.markdown(
         """
@@ -572,7 +645,6 @@ def main():
     )
     st.title("Video Annotation — Taste Prediction Database")
 
-    conn = get_db_connection()
     ensure_table(conn)
 
     pairs = collect_video_analysis_pairs()
