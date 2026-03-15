@@ -872,7 +872,7 @@ def main():
     with left:
         st.subheader("Video")
         if Path(video_full_path).is_file():
-            st.video(video_full_path, autoplay=True, loop=True, muted=True)
+            st.video(video_full_path, autoplay=True, loop=True, muted=False)
         else:
             st.warning("Video file not found.")
 
