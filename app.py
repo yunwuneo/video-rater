@@ -7,6 +7,7 @@ Run from the parent directory that contains both `videos/` and `analysis/` folde
 import json
 import logging
 import os
+import random
 import re
 import threading
 import time
@@ -853,11 +854,24 @@ def main():
         st.info("No unrated videos. All videos with valid analysis have been rated.")
         st.stop()
 
+    # 每次会话使用随机顺序：在 session 内保持打乱后的列表，仅移除已评分、追加新视频
+    shuffled_key = "shuffled_unrated"
+    if shuffled_key not in st.session_state:
+        st.session_state[shuffled_key] = random.sample(unrated, len(unrated))
+    else:
+        prev = st.session_state[shuffled_key]
+        still_unrated = [(vp, jp, mp, jpath) for vp, jp, mp, jpath in prev if vp not in rated_paths]
+        existing_paths = {u[0] for u in still_unrated}
+        new_ones = [u for u in unrated if u[0] not in existing_paths]
+        st.session_state[shuffled_key] = still_unrated + random.sample(new_ones, len(new_ones))
+
+    display_list = st.session_state[shuffled_key]
+
     # Use session state to track current index (stable across reruns after submit)
     if "current_index" not in st.session_state:
         st.session_state.current_index = 0
-    idx = min(st.session_state.current_index, len(unrated) - 1)
-    video_path_str, json_path_str, mp4_path, json_path = unrated[idx]
+    idx = min(st.session_state.current_index, len(display_list) - 1)
+    video_path_str, json_path_str, mp4_path, json_path = display_list[idx]
 
     analysis = load_analysis(json_path)
     if analysis is None:
@@ -883,8 +897,8 @@ def main():
                 st.session_state.current_index = max(0, idx - 1)
                 st.rerun()
         with col_next:
-            if st.button("下一视频 →", key="btn_next_video", disabled=(idx >= len(unrated) - 1)):
-                st.session_state.current_index = min(len(unrated) - 1, idx + 1)
+            if st.button("下一视频 →", key="btn_next_video", disabled=(idx >= len(display_list) - 1)):
+                st.session_state.current_index = min(len(display_list) - 1, idx + 1)
                 st.rerun()
 
     with right:
@@ -1082,7 +1096,7 @@ def main():
                 st.rerun()
 
     # Optional: show current position in queue
-    st.caption(f"Current: video {idx + 1} of {len(unrated)} unrated.")
+    st.caption(f"Current: video {idx + 1} of {len(display_list)} unrated.")
 
 
 if __name__ == "__main__":
